@@ -34,4 +34,4 @@ ENV APP_PORT=8000
 
 EXPOSE 8000
 
-ENTRYPOINT ["./http-sms", "--dotenv=false"]
+ENTRYPOINT /bin/sh -c "export APP_PORT=\${PORT:-8000} && exec ./http-sms --dotenv=false"
