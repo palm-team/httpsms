@@ -8,8 +8,8 @@ COPY package.json pnpm-lock.yaml ./
 # Install pnpm
 RUN npm install -g pnpm@9
 
-# install python
-RUN apk add --no-cache python3
+# Install build tools for native modules (deasync, protobufjs, etc.)
+RUN apk add --no-cache python3 make g++ gcc linux-headers
 
 RUN pnpm install
 COPY . .
