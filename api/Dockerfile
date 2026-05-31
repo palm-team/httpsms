@@ -29,5 +29,9 @@ WORKDIR /home/http-sms
 COPY --from=builder /usr/local/go/lib/time/zoneinfo.zip /zoneinfo.zip
 COPY --from=builder /bin/http-sms ./
 ENV ZONEINFO=/zoneinfo.zip
+ENV APP_HOST=0.0.0.0
+ENV APP_PORT=8000
 
-ENTRYPOINT ["/bin/sh", "-c", "export APP_PORT=${APP_PORT:-${PORT:-8000}} && export APP_HOST=${APP_HOST:-0.0.0.0} && exec ./http-sms --dotenv=false"]
+EXPOSE 8000
+
+ENTRYPOINT ["./http-sms", "--dotenv=false"]
