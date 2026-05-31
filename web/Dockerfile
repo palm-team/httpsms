@@ -25,6 +25,4 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf
 # Install gettext for envsubst
 RUN apk add --no-cache gettext
 
-EXPOSE 3000
-
 CMD export PORT=${PORT:-3000} && envsubst '${PORT}' < /etc/nginx/conf.d/default.conf > /tmp/default.conf && mv /tmp/default.conf /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'
