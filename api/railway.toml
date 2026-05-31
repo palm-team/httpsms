@@ -3,7 +3,7 @@ builder = "DOCKERFILE"
 dockerfilePath = "api/Dockerfile"
 
 [deploy]
-healthcheckPath = "/v1/messages/search"
+healthcheckPath = "/health"
 healthcheckTimeout = 300
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
