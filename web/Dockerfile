@@ -16,12 +16,15 @@ COPY . .
 RUN pnpm run generate
 
 # production stage
-FROM nginx:stable-alpine as production
+FROM nginx:stable-alpine AS production
 COPY --from=build /app/dist /usr/share/nginx/html
 
 # Copy the nginx configuration file
 COPY ./nginx.conf /etc/nginx/conf.d/default.conf
 
+# Install gettext for envsubst
+RUN apk add --no-cache gettext
+
 EXPOSE 3000
 
-CMD ["nginx", "-g", "daemon off;"]
+CMD ["/bin/sh", "-c", "export PORT=${PORT:-3000} && envsubst '${PORT}' < /etc/nginx/conf.d/default.conf > /tmp/default.conf && mv /tmp/default.conf /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'"

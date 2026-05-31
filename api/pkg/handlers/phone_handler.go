@@ -3,6 +3,7 @@ package handlers
 import (
 	"fmt"
 
+	"github.com/NdoleStudio/httpsms/pkg/repositories"
 	"github.com/NdoleStudio/httpsms/pkg/requests"
 	"github.com/NdoleStudio/httpsms/pkg/validators"
 	"github.com/davecgh/go-spew/spew"
@@ -121,13 +122,13 @@ func (h *PhoneHandler) Upsert(c *fiber.Ctx) error {
 		return h.responseBadRequest(c, err)
 	}
 
-	if errors := h.validator.ValidateUpsert(ctx, request.Sanitize()); len(errors) != 0 {
+	if errors := h.validator.ValidateUpsert(ctx, h.userIDFomContext(c), request.Sanitize()); len(errors) != 0 {
 		msg := fmt.Sprintf("validation errors [%s], while updating phones [%+#v]", spew.Sdump(errors), request)
 		ctxLogger.Warn(stacktrace.NewError(msg))
 		return h.responseUnprocessableEntity(c, errors, "validation errors while updating phones")
 	}
 
-	phone, err := h.service.Upsert(ctx, request.ToUpsertParams(h.userFromContext(c), c.OriginalURL()))
+	phone, err := h.service.Upsert(ctx, request.ToUpsertParams(h.userFromContext(c), c.OriginalURL(), c.Body()))
 	if err != nil {
 		msg := fmt.Sprintf("cannot update phones with params [%+#v]", request)
 		ctxLogger.Error(stacktrace.Propagate(err, msg))
@@ -165,6 +166,9 @@ func (h *PhoneHandler) Delete(c *fiber.Ctx) error {
 	}
 
 	err := h.service.Delete(ctx, c.OriginalURL(), h.userIDFomContext(c), request.PhoneIDUuid())
+	if stacktrace.GetCode(err) == repositories.ErrCodeNotFound {
+		return h.responseNotFound(c, fmt.Sprintf("cannot find phone with ID [%s]", request.PhoneID))
+	}
 	if err != nil {
 		msg := fmt.Sprintf("cannot delete phones with params [%+#v]", request)
 		ctxLogger.Error(stacktrace.Propagate(err, msg))

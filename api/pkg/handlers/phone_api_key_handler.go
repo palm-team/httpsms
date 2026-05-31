@@ -3,6 +3,7 @@ package handlers
 import (
 	"fmt"
 
+	"github.com/NdoleStudio/httpsms/pkg/entities"
 	"github.com/NdoleStudio/httpsms/pkg/repositories"
 	"github.com/NdoleStudio/httpsms/pkg/requests"
 	"github.com/NdoleStudio/httpsms/pkg/services"
@@ -17,10 +18,11 @@ import (
 // PhoneAPIKeyHandler handles phone API key http requests
 type PhoneAPIKeyHandler struct {
 	handler
-	logger    telemetry.Logger
-	tracer    telemetry.Tracer
-	validator *validators.PhoneAPIKeyHandlerValidator
-	service   *services.PhoneAPIKeyService
+	logger             telemetry.Logger
+	tracer             telemetry.Tracer
+	validator          *validators.PhoneAPIKeyHandlerValidator
+	service            *services.PhoneAPIKeyService
+	entitlementService *services.EntitlementService
 }
 
 // NewPhoneAPIKeyHandler creates a new PhoneAPIKeyHandler
@@ -29,12 +31,14 @@ func NewPhoneAPIKeyHandler(
 	tracer telemetry.Tracer,
 	validator *validators.PhoneAPIKeyHandlerValidator,
 	service *services.PhoneAPIKeyService,
+	entitlementService *services.EntitlementService,
 ) *PhoneAPIKeyHandler {
 	return &PhoneAPIKeyHandler{
-		logger:    logger.WithService(fmt.Sprintf("%T", &PhoneAPIKeyHandler{})),
-		tracer:    tracer,
-		validator: validator,
-		service:   service,
+		logger:             logger.WithService(fmt.Sprintf("%T", &PhoneAPIKeyHandler{})),
+		tracer:             tracer,
+		validator:          validator,
+		service:            service,
+		entitlementService: entitlementService,
 	}
 }
 
@@ -99,12 +103,26 @@ func (h *PhoneAPIKeyHandler) index(c *fiber.Ctx) error {
 // @Success      200 		{object}	responses.PhoneAPIKeyResponse
 // @Failure      400		{object}	responses.BadRequest
 // @Failure 	 401    	{object}	responses.Unauthorized
+// @Failure 	 402		{object}	responses.PaymentRequired
 // @Failure      422		{object}	responses.UnprocessableEntity
 // @Failure      500		{object}	responses.InternalServerError
 // @Router       /phone-api-keys [post]
 func (h *PhoneAPIKeyHandler) store(c *fiber.Ctx) error {
 	ctx, span, ctxLogger := h.tracer.StartFromFiberCtxWithLogger(c, h.logger)
 	defer span.End()
+
+	userID := h.userIDFomContext(c)
+
+	result, err := h.entitlementService.Check(ctx, userID, entities.EntityNamePhoneAPIKey, func() (int, error) {
+		return h.service.CountByUser(ctx, userID)
+	})
+	if err != nil {
+		ctxLogger.Error(stacktrace.Propagate(err, fmt.Sprintf("cannot check entitlement for phone API keys for user [%s]", userID)))
+		return h.responseInternalServerError(c)
+	}
+	if !result.Allowed {
+		return h.responsePaymentRequired(c, result.Message)
+	}
 
 	var request requests.PhoneAPIKeyStoreRequest
 	if err := c.BodyParser(&request); err != nil {

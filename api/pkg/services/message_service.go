@@ -123,6 +123,21 @@ func (service *MessageService) DeleteAllForUser(ctx context.Context, userID enti
 	return nil
 }
 
+// GetBulkMessages fetches the last bulk message summaries for a user
+func (service *MessageService) GetBulkMessages(ctx context.Context, userID entities.UserID) ([]*entities.BulkMessage, error) {
+	ctx, span, ctxLogger := service.tracer.StartWithLogger(ctx, service.logger)
+	defer span.End()
+
+	orders, err := service.repository.GetBulkMessages(ctx, userID, 10)
+	if err != nil {
+		msg := fmt.Sprintf("could not fetch bulk messages for user [%s]", userID)
+		return nil, service.tracer.WrapErrorSpan(span, stacktrace.Propagate(err, msg))
+	}
+
+	ctxLogger.Info(fmt.Sprintf("fetched [%d] bulk messages for user [%s]", len(orders), userID))
+	return orders, nil
+}
+
 // DeleteMessage deletes a message from the database
 func (service *MessageService) DeleteMessage(ctx context.Context, source string, message *entities.Message) error {
 	ctx, span := service.tracer.Start(ctx)
@@ -461,6 +476,7 @@ type MessageSendParams struct {
 	RequestID         *string
 	UserID            entities.UserID
 	RequestReceivedAt time.Time
+	Index             int
 }
 
 // SendMessage a new message
@@ -470,7 +486,7 @@ func (service *MessageService) SendMessage(ctx context.Context, params MessageSe
 
 	ctxLogger := service.tracer.CtxLogger(service.logger, span)
 
-	sendAttempts, sim := service.phoneSettings(ctx, params.UserID, phonenumbers.Format(params.Owner, phonenumbers.E164))
+	sendAttempts, sim, messagesPerMinute := service.phoneSettings(ctx, params.UserID, phonenumbers.Format(params.Owner, phonenumbers.E164))
 
 	eventPayload := events.MessageAPISentPayload{
 		MessageID:         uuid.New(),
@@ -484,6 +500,7 @@ func (service *MessageService) SendMessage(ctx context.Context, params MessageSe
 		Content:           params.Content,
 		Attachments:       params.Attachments,
 		ScheduledSendTime: params.SendAt,
+		ExactSendTime:     params.SendAt != nil,
 		SIM:               sim,
 	}
 
@@ -500,7 +517,7 @@ func (service *MessageService) SendMessage(ctx context.Context, params MessageSe
 		return nil, service.tracer.WrapErrorSpan(span, stacktrace.Propagate(err, msg))
 	}
 
-	timeout := service.getSendDelay(ctxLogger, eventPayload, params.SendAt)
+	timeout := service.getSendDelay(ctxLogger, eventPayload, params, messagesPerMinute)
 	if _, err = service.eventDispatcher.DispatchWithTimeout(ctx, event, timeout); err != nil {
 		msg := fmt.Sprintf("cannot dispatch event type [%s] and id [%s]", event.Type(), event.ID())
 		return nil, service.tracer.WrapErrorSpan(span, stacktrace.Propagate(err, msg))
@@ -559,18 +576,24 @@ func (service *MessageService) RegisterMissedCall(ctx context.Context, params *M
 	return message, err
 }
 
-func (service *MessageService) getSendDelay(ctxLogger telemetry.Logger, eventPayload events.MessageAPISentPayload, sendAt *time.Time) time.Duration {
-	if sendAt == nil {
-		return time.Duration(0)
+func (service *MessageService) getSendDelay(ctxLogger telemetry.Logger, eventPayload events.MessageAPISentPayload, params MessageSendParams, messagesPerMinute uint) time.Duration {
+	if params.SendAt != nil {
+		delay := params.SendAt.Sub(time.Now().UTC())
+		if delay < 0 {
+			ctxLogger.Info(fmt.Sprintf("message [%s] has send time [%s] in the past. sending immediately", eventPayload.MessageID, params.SendAt.String()))
+			return time.Duration(0)
+		}
+		return delay
 	}
 
-	delay := sendAt.Sub(time.Now().UTC())
-	if delay < 0 {
-		ctxLogger.Info(fmt.Sprintf("message [%s] has send time [%s] in the past. sending immediately", eventPayload.MessageID, sendAt.String()))
-		return time.Duration(0)
+	if params.Index > 0 && messagesPerMinute > 0 {
+		interval := time.Minute / time.Duration(messagesPerMinute)
+		delay := time.Duration(params.Index) * interval
+		ctxLogger.Info(fmt.Sprintf("message [%s] bulk index [%d] rate-based delay [%s]", eventPayload.MessageID, params.Index, delay))
+		return delay
 	}
 
-	return delay
+	return time.Duration(0)
 }
 
 // StoreReceivedMessage a new message
@@ -1011,7 +1034,7 @@ func (service *MessageService) SearchMessages(ctx context.Context, params *Messa
 	return messages, nil
 }
 
-func (service *MessageService) phoneSettings(ctx context.Context, userID entities.UserID, owner string) (uint, entities.SIM) {
+func (service *MessageService) phoneSettings(ctx context.Context, userID entities.UserID, owner string) (uint, entities.SIM, uint) {
 	ctx, span := service.tracer.Start(ctx)
 	defer span.End()
 
@@ -1021,10 +1044,10 @@ func (service *MessageService) phoneSettings(ctx context.Context, userID entitie
 	if err != nil {
 		msg := fmt.Sprintf("cannot load phone for userID [%s] and owner [%s]. using default max send attempt of 2", userID, owner)
 		ctxLogger.Error(stacktrace.Propagate(err, msg))
-		return 2, entities.SIM1
+		return 2, entities.SIM1, 0
 	}
 
-	return phone.MaxSendAttemptsSanitized(), phone.SIM
+	return phone.MaxSendAttemptsSanitized(), phone.SIM, phone.MessagesPerMinute
 }
 
 // storeSentMessage a new message

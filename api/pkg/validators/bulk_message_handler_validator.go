@@ -52,7 +52,7 @@ func NewBulkMessageHandlerValidator(
 }
 
 // ValidateStore validates the requests.BillingUsageHistory request
-func (v *BulkMessageHandlerValidator) ValidateStore(ctx context.Context, userID entities.UserID, header *multipart.FileHeader) ([]*requests.BulkMessage, url.Values) {
+func (v *BulkMessageHandlerValidator) ValidateStore(ctx context.Context, userID entities.UserID, header *multipart.FileHeader) ([]*requests.BulkMessage, *time.Location, url.Values) {
 	ctx, span, ctxLogger := v.tracer.StartWithLogger(ctx, v.logger)
 	defer span.End()
 
@@ -61,39 +61,39 @@ func (v *BulkMessageHandlerValidator) ValidateStore(ctx context.Context, userID 
 		result := url.Values{}
 		result.Add("document", "Cannot load your account. Please try again later or contact support.")
 		ctxLogger.Error(v.tracer.WrapErrorSpan(span, stacktrace.Propagate(err, fmt.Sprintf("cannot load user [%s]", userID))))
-		return nil, result
+		return nil, nil, result
 	}
 
 	messages, result := v.parseFile(ctxLogger, user, header)
 	if len(result) != 0 {
-		return messages, result
+		return messages, user.Location(), result
 	}
 
 	if len(messages) == 0 {
 		result.Add("document", "The uploaded file doesn't contain any valid records. Make sure you are using the official httpSMS template.")
-		return messages, result
+		return messages, user.Location(), result
 	}
 
 	if len(messages) > 1000 {
 		result.Add("document", "The uploaded file must contain less than 1000 records.")
-		return messages, result
+		return messages, user.Location(), result
 	}
 
 	for index, message := range messages {
 		messages[index] = message.Sanitize()
 	}
 
-	result = v.validateMessages(ctx, messages)
+	result = v.validateMessages(ctx, messages, user.Location())
 	if len(result) != 0 {
-		return messages, result
+		return messages, user.Location(), result
 	}
 
 	result = v.validateOwners(ctx, userID, messages)
 	if len(result) != 0 {
-		return messages, result
+		return messages, user.Location(), result
 	}
 
-	return messages, result
+	return messages, user.Location(), result
 }
 
 func (v *BulkMessageHandlerValidator) parseFile(ctxLogger telemetry.Logger, user *entities.User, header *multipart.FileHeader) ([]*requests.BulkMessage, url.Values) {
@@ -138,14 +138,16 @@ func (v *BulkMessageHandlerValidator) parseXlsx(ctxLogger telemetry.Logger, user
 			continue
 		}
 
-		var sendAt *time.Time
+		var sendTimeRaw string
 		if len(row) > 3 && strings.TrimSpace(row[3]) != "" {
 			ctxLogger.Info(fmt.Sprintf("excel time = [%s]", row[3]))
-			sendAt, err = v.convertExcelTime(user, row[3])
-			if err != nil {
+			msg := &requests.BulkMessage{SendTime: strings.TrimSpace(row[3])}
+			sendAt := msg.GetSendTime(user.Location())
+			if sendAt == nil {
 				result.Add("document", fmt.Sprintf("Row [%d]: The SendTime [%s] is not in the correct format e.g [2006-01-02T15:04:05] where 2006 is the year, 01 is January, 02 is the second day of the month and the time is 15:04:05", index+1, row[3]))
 				return nil, result
 			}
+			sendTimeRaw = sendAt.Format(time.RFC3339)
 		}
 
 		var attachmentURLs string
@@ -157,21 +159,12 @@ func (v *BulkMessageHandlerValidator) parseXlsx(ctxLogger telemetry.Logger, user
 			FromPhoneNumber: strings.TrimSpace(row[0]),
 			ToPhoneNumber:   strings.TrimSpace(row[1]),
 			Content:         row[2],
-			SendTime:        sendAt,
+			SendTime:        sendTimeRaw,
 			AttachmentURLs:  attachmentURLs,
 		})
 	}
 
 	return messages, url.Values{}
-}
-
-func (v *BulkMessageHandlerValidator) convertExcelTime(user *entities.User, value string) (*time.Time, error) {
-	t, err := time.ParseInLocation("2006-01-02T15:04:05", value, user.Location())
-	if err != nil {
-		return nil, stacktrace.Propagate(err, fmt.Sprintf("cannot parse excel time [%s] as [%T]", value, t))
-	}
-
-	return &t, nil
 }
 
 func (v *BulkMessageHandlerValidator) parseBytes(ctxLogger telemetry.Logger, userID entities.UserID, header *multipart.FileHeader) ([]byte, url.Values) {
@@ -220,7 +213,7 @@ func (v *BulkMessageHandlerValidator) parseCSV(ctxLogger telemetry.Logger, user 
 	return messages, url.Values{}
 }
 
-func (v *BulkMessageHandlerValidator) validateMessages(_ context.Context, messages []*requests.BulkMessage) url.Values {
+func (v *BulkMessageHandlerValidator) validateMessages(_ context.Context, messages []*requests.BulkMessage, location *time.Location) url.Values {
 	result := url.Values{}
 	for index, message := range messages {
 
@@ -265,8 +258,13 @@ func (v *BulkMessageHandlerValidator) validateMessages(_ context.Context, messag
 			result.Add("document", fmt.Sprintf("Row [%d]: The message content must be less than 1024 characters.", index+2))
 		}
 
-		if message.SendTime != nil && message.SendTime.After(time.Now().Add(420*time.Hour)) {
-			result.Add("document", fmt.Sprintf("Row [%d]: The SendTime [%s] cannot be more than 20 days (420 hours) in the future.", index+2, message.SendTime.Format(time.RFC3339)))
+		if strings.TrimSpace(message.SendTime) != "" {
+			sendTime := message.GetSendTime(location)
+			if sendTime == nil {
+				result.Add("document", fmt.Sprintf("Row [%d]: The SendTime [%s] is not a valid date format. Use RFC3339 (e.g. 2023-11-11T02:10:01Z) or YYYY-MM-DDTHH:MM:SS.", index+2, message.SendTime))
+			} else if sendTime.After(time.Now().Add(420 * time.Hour)) {
+				result.Add("document", fmt.Sprintf("Row [%d]: The SendTime [%s] cannot be more than 20 days (420 hours) in the future.", index+2, sendTime.Format(time.RFC3339)))
+			}
 		}
 	}
 	return result

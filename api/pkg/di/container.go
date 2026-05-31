@@ -4,17 +4,16 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/NdoleStudio/httpsms/docs"
 	plunk "github.com/NdoleStudio/plunk-go"
 	"github.com/pusher/pusher-http-go/v5"
-	"gorm.io/driver/sqlite"
-
-	"github.com/NdoleStudio/httpsms/docs"
 
 	otelMetric "go.opentelemetry.io/otel/metric"
 
@@ -46,10 +45,13 @@ import (
 	cloudtasks "cloud.google.com/go/cloudtasks/apiv2"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.10.0"
 
-	"firebase.google.com/go/messaging"
+	axiomzerolog "github.com/axiomhq/axiom-go/adapters/zerolog"
 	"github.com/hirosassa/zerodriver"
 	"github.com/rs/zerolog"
 	"go.opentelemetry.io/otel/sdk/trace"
@@ -59,6 +61,7 @@ import (
 	"github.com/NdoleStudio/httpsms/pkg/middlewares"
 	"google.golang.org/api/option"
 
+	"github.com/gofiber/fiber/v2/middleware/compress"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 
 	"github.com/NdoleStudio/httpsms/pkg/entities"
@@ -75,6 +78,7 @@ import (
 	"github.com/NdoleStudio/httpsms/pkg/handlers"
 	"github.com/NdoleStudio/httpsms/pkg/telemetry"
 	"github.com/NdoleStudio/httpsms/pkg/validators"
+	mongoDriver "go.mongodb.org/mongo-driver/v2/mongo"
 	"gorm.io/driver/postgres"
 	gormLogger "gorm.io/gorm/logger"
 )
@@ -84,11 +88,15 @@ type Container struct {
 	projectID            string
 	db                   *gorm.DB
 	dedicatedDB          *gorm.DB
+	mongoDB              *mongoDriver.Database
 	version              string
 	app                  *fiber.App
 	eventDispatcher      *services.EventDispatcher
 	logger               telemetry.Logger
 	attachmentRepository repositories.AttachmentRepository
+	userRistrettoCache   *ristretto.Cache[string, entities.AuthContext]
+	phoneRistrettoCache  *ristretto.Cache[string, *entities.Phone]
+	inMemoryCache        cache.Cache
 }
 
 // NewLiteContainer creates a Container without any routes or listeners
@@ -130,9 +138,12 @@ func NewContainer(projectID string, version string) (container *Container) {
 	container.RegisterHeartbeatListeners()
 
 	container.RegisterUserRoutes()
+	container.RegisterMessageSendScheduleRoutes()
+	container.RegisterMessageSendScheduleListeners()
 	container.RegisterUserListeners()
 
 	container.RegisterPhoneRoutes()
+	container.RegisterPhoneListeners()
 
 	container.RegisterEventRoutes()
 
@@ -174,6 +185,15 @@ func (container *Container) App() (app *fiber.App) {
 	container.logger.Debug(fmt.Sprintf("creating %T", app))
 
 	app = fiber.New()
+
+	// Health check endpoint registered before middleware for reliable Docker health checks
+	app.Get("/health", func(c *fiber.Ctx) error {
+		return c.SendStatus(fiber.StatusOK)
+	})
+
+	app.Use(compress.New(compress.Config{
+		Level: compress.LevelBestCompression,
+	}))
 
 	if os.Getenv("USE_HTTP_LOGGER") == "true" {
 		app.Use(fiberLogger.New())
@@ -234,12 +254,6 @@ func (container *Container) GormLogger() gormLogger.Interface {
 }
 
 func (container *Container) connect(dsn string, config *gorm.Config) (db *gorm.DB, err error) {
-	if strings.HasPrefix(dsn, "libsql://") {
-		return gorm.Open(sqlite.New(sqlite.Config{
-			DriverName: "libsql",
-			DSN:        dsn,
-		}), config)
-	}
 	return gorm.Open(postgres.Open(dsn), config)
 }
 
@@ -262,17 +276,14 @@ func (container *Container) DedicatedDB() (db *gorm.DB) {
 		container.logger.Fatal(err)
 	}
 
-	sqlDB, err := db.DB()
-	if err != nil {
-		container.logger.Fatal(stacktrace.Propagate(err, "cannot get sql.DB from GORM"))
-	}
-
-	sqlDB.SetMaxOpenConns(1)
-	sqlDB.SetMaxIdleConns(0)
-	sqlDB.SetConnMaxLifetime(10 * time.Second)
-
 	if err = db.Use(tracing.NewPlugin()); err != nil {
 		container.logger.Fatal(stacktrace.Propagate(err, "cannot use GORM tracing plugin"))
+	}
+
+	container.dedicatedDB = db
+	if os.Getenv("DATABASE_MIGRATION_SKIP") != "" {
+		container.logger.Debug(fmt.Sprintf("skipping migrations for [%T]", db))
+		return container.dedicatedDB
 	}
 
 	container.logger.Debug(fmt.Sprintf("Running migrations for dedicated [%T]", db))
@@ -284,8 +295,24 @@ func (container *Container) DedicatedDB() (db *gorm.DB) {
 		container.logger.Fatal(stacktrace.Propagate(err, fmt.Sprintf("cannot migrate %T", &entities.HeartbeatMonitor{})))
 	}
 
-	container.dedicatedDB = db
 	return container.dedicatedDB
+}
+
+// MongoDB creates a *mongo.Database connection to MongoDB Atlas
+func (container *Container) MongoDB() *mongoDriver.Database {
+	if container.mongoDB != nil {
+		return container.mongoDB
+	}
+
+	container.logger.Debug("creating MongoDB *mongo.Database connection")
+
+	db, err := repositories.NewMongoDB(os.Getenv("MONGODB_URI"))
+	if err != nil {
+		container.logger.Fatal(err)
+	}
+
+	container.mongoDB = db
+	return container.mongoDB
 }
 
 // DBWithoutMigration creates an instance of gorm.DB if it has not been created already
@@ -364,6 +391,10 @@ ALTER TABLE discords ADD CONSTRAINT IF NOT EXISTS uni_discords_server_id CHECK (
 		container.logger.Fatal(stacktrace.Propagate(err, fmt.Sprintf("cannot migrate %T", &entities.User{})))
 	}
 
+	if err = db.AutoMigrate(&entities.MessageSendSchedule{}); err != nil {
+		container.logger.Fatal(stacktrace.Propagate(err, fmt.Sprintf("cannot migrate %T", &entities.MessageSendSchedule{})))
+	}
+
 	if err = db.AutoMigrate(&entities.Phone{}); err != nil {
 		container.logger.Fatal(stacktrace.Propagate(err, fmt.Sprintf("cannot migrate %T", &entities.Phone{})))
 	}
@@ -398,7 +429,8 @@ ALTER TABLE discords ADD CONSTRAINT IF NOT EXISTS uni_discords_server_id CHECK (
 // FirebaseApp creates a new instance of firebase.App
 func (container *Container) FirebaseApp() (app *firebase.App) {
 	container.logger.Debug(fmt.Sprintf("creating %T", app))
-	app, err := firebase.NewApp(context.Background(), nil, option.WithAuthCredentialsJSON(option.ServiceAccount, container.FirebaseCredentials()))
+
+	app, err := firebase.NewApp(context.Background(), nil, option.WithCredentialsJSON(container.FirebaseCredentials()))
 	if err != nil {
 		msg := "cannot initialize firebase application"
 		container.logger.Fatal(stacktrace.Propagate(err, msg))
@@ -406,11 +438,15 @@ func (container *Container) FirebaseApp() (app *firebase.App) {
 	return app
 }
 
-// InMemoryCache creates a new instance of the in memory cache.Cache
+// InMemoryCache returns the shared in-memory cache.Cache, creating it on the first call.
 func (container *Container) InMemoryCache() cache.Cache {
+	if container.inMemoryCache != nil {
+		return container.inMemoryCache
+	}
 	container.logger.Debug("creating an in memory cache")
 	c := ttlCache.New(time.Hour, time.Hour*2)
-	return cache.NewMemoryCache(container.Tracer(), c)
+	container.inMemoryCache = cache.NewMemoryCache(container.Tracer(), c)
+	return container.inMemoryCache
 }
 
 // Cache creates a new instance of cache.Cache
@@ -420,8 +456,10 @@ func (container *Container) Cache() cache.Cache {
 	if err != nil {
 		container.logger.Fatal(stacktrace.Propagate(err, fmt.Sprintf("cannot parse redis url [%s]", os.Getenv("REDIS_URL"))))
 	}
-	opt.TLSConfig = &tls.Config{
-		MinVersion: tls.VersionTLS12,
+	if strings.HasPrefix(os.Getenv("REDIS_URL"), "rediss://") {
+		opt.TLSConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		}
 	}
 
 	redisClient := redis.NewClient(opt)
@@ -507,15 +545,27 @@ func (container *Container) CloudTaskEventsQueue() (queue services.PushQueue) {
 	)
 }
 
-// FirebaseMessagingClient creates a new instance of messaging.Client
-func (container *Container) FirebaseMessagingClient() (client *messaging.Client) {
-	container.logger.Debug(fmt.Sprintf("creating %T", client))
+// FCMClient creates the appropriate FCM client based on configuration.
+// When FCM_ENDPOINT is set, it returns an EmulatorFCMClient that sends
+// notifications directly to the phone emulator via HTTP.
+// Otherwise, it returns a FirebaseFCMClient that uses the real Firebase SDK.
+func (container *Container) FCMClient() services.FCMClient {
+	if fcmEndpoint := os.Getenv("FCM_ENDPOINT"); fcmEndpoint != "" {
+		container.logger.Info(fmt.Sprintf("using emulator FCM client with endpoint: %s", fcmEndpoint))
+		return services.NewEmulatorFCMClient(
+			container.HTTPClient("emulator_fcm"),
+			fcmEndpoint,
+			container.Logger(),
+		)
+	}
+
+	container.logger.Debug("creating FirebaseFCMClient")
 	messagingClient, err := container.FirebaseApp().Messaging(context.Background())
 	if err != nil {
 		msg := "cannot initialize firebase messaging client"
 		container.logger.Fatal(stacktrace.Propagate(err, msg))
 	}
-	return messagingClient
+	return services.NewFirebaseFCMClient(messagingClient)
 }
 
 // FirebaseCredentials returns firebase credentials as bytes.
@@ -665,6 +715,7 @@ func (container *Container) PhoneHandlerValidator() (validator *validators.Phone
 	return validators.NewPhoneHandlerValidator(
 		container.Logger(),
 		container.Tracer(),
+		container.MessageSendScheduleService(),
 	)
 }
 
@@ -753,6 +804,48 @@ func (container *Container) PhoneRepository() (repository repositories.PhoneRepo
 	)
 }
 
+// MessageSendScheduleRepository creates a new instance of repositories.MessageSendScheduleRepository
+func (container *Container) MessageSendScheduleRepository() repositories.MessageSendScheduleRepository {
+	container.logger.Debug("creating GORM repositories.MessageSendScheduleRepository")
+	return repositories.NewGormMessageSendScheduleRepository(
+		container.Logger(),
+		container.Tracer(),
+		container.DB(),
+	)
+}
+
+// MessageSendScheduleService creates a new instance of services.MessageSendScheduleService
+func (container *Container) MessageSendScheduleService() *services.MessageSendScheduleService {
+	container.logger.Debug("creating services.MessageSendScheduleService")
+	return services.NewMessageSendScheduleService(
+		container.Logger(),
+		container.Tracer(),
+		container.MessageSendScheduleRepository(),
+		container.EventDispatcher(),
+	)
+}
+
+// MessageSendScheduleHandlerValidator creates a new instance of validators.MessageSendScheduleHandlerValidator
+func (container *Container) MessageSendScheduleHandlerValidator() *validators.MessageSendScheduleHandlerValidator {
+	container.logger.Debug("creating validators.MessageSendScheduleHandlerValidator")
+	return validators.NewMessageSendScheduleHandlerValidator(
+		container.Logger(),
+		container.Tracer(),
+	)
+}
+
+// MessageSendScheduleHandler creates a new instance of handlers.MessageSendScheduleHandler
+func (container *Container) MessageSendScheduleHandler() *handlers.MessageSendScheduleHandler {
+	container.logger.Debug("creating handlers.MessageSendScheduleHandler")
+	return handlers.NewMessageSendScheduleHandler(
+		container.Logger(),
+		container.Tracer(),
+		container.MessageSendScheduleHandlerValidator(),
+		container.MessageSendScheduleService(),
+		container.EntitlementService(),
+	)
+}
+
 // BillingUsageRepository creates a new instance of repositories.BillingUsageRepository
 func (container *Container) BillingUsageRepository() (repository repositories.BillingUsageRepository) {
 	container.logger.Debug("creating GORM repositories.BillingUsageRepository")
@@ -760,6 +853,17 @@ func (container *Container) BillingUsageRepository() (repository repositories.Bi
 		container.Logger(),
 		container.Tracer(),
 		container.DB(),
+	)
+}
+
+// EntitlementService creates a new instance of services.EntitlementService
+func (container *Container) EntitlementService() *services.EntitlementService {
+	container.logger.Debug("creating services.EntitlementService")
+	return services.NewEntitlementService(
+		container.Logger(),
+		container.Tracer(),
+		os.Getenv("ENTITLEMENT_ENABLED") == "true",
+		container.UserRepository(),
 	)
 }
 
@@ -805,12 +909,22 @@ func (container *Container) MessageThreadRepository() (repository repositories.M
 
 // HeartbeatMonitorRepository creates a new instance of repositories.HeartbeatMonitorRepository
 func (container *Container) HeartbeatMonitorRepository() (repository repositories.HeartbeatMonitorRepository) {
-	container.logger.Debug("creating GORM repositories.HeartbeatMonitorRepository")
-	return repositories.NewGormHeartbeatMonitorRepository(
-		container.Logger(),
-		container.Tracer(),
-		container.DedicatedDB(),
-	)
+	switch os.Getenv("HEARTBEAT_DB_BACKEND") {
+	case "mongodb":
+		container.logger.Debug("creating MongoDB repositories.HeartbeatMonitorRepository")
+		return repositories.NewMongoHeartbeatMonitorRepository(
+			container.Logger(),
+			container.Tracer(),
+			container.MongoDB(),
+		)
+	default:
+		container.logger.Debug("creating GORM repositories.HeartbeatMonitorRepository")
+		return repositories.NewGormHeartbeatMonitorRepository(
+			container.Logger(),
+			container.Tracer(),
+			container.DedicatedDB(),
+		)
+	}
 }
 
 // HeartbeatService creates a new instance of services.HeartbeatService
@@ -1097,6 +1211,20 @@ func (container *Container) RegisterMessageListeners() {
 	}
 }
 
+// RegisterMessageSendScheduleListeners registers event listeners for listeners.MessageSendScheduleListener
+func (container *Container) RegisterMessageSendScheduleListeners() {
+	container.logger.Debug(fmt.Sprintf("registering listeners for %T", listeners.MessageSendScheduleListener{}))
+	_, routes := listeners.NewMessageSendScheduleListener(
+		container.Logger(),
+		container.Tracer(),
+		container.MessageSendScheduleService(),
+	)
+
+	for event, handler := range routes {
+		container.EventDispatcher().Subscribe(event, handler)
+	}
+}
+
 // LemonsqueezyService creates a new instance of services.LemonsqueezyService
 func (container *Container) LemonsqueezyService() (service *services.LemonsqueezyService) {
 	container.logger.Debug(fmt.Sprintf("creating %T", service))
@@ -1141,6 +1269,7 @@ func (container *Container) PhoneAPIKeyHandler() (handler *handlers.PhoneAPIKeyH
 		container.Tracer(),
 		container.PhoneAPIKeyHandlerValidator(),
 		container.PhoneAPIKeyService(),
+		container.EntitlementService(),
 	)
 }
 
@@ -1390,6 +1519,20 @@ func (container *Container) RegisterPhoneAPIKeyListeners() {
 	}
 }
 
+// RegisterPhoneListeners registers event listeners for listeners.PhoneListener
+func (container *Container) RegisterPhoneListeners() {
+	container.logger.Debug(fmt.Sprintf("registering listeners for %T", listeners.PhoneListener{}))
+	_, routes := listeners.NewPhoneListener(
+		container.Logger(),
+		container.Tracer(),
+		container.PhoneService(),
+	)
+
+	for event, handler := range routes {
+		container.EventDispatcher().Subscribe(event, handler)
+	}
+}
+
 // RegisterWebsocketListeners registers event listeners for listeners.WebsocketListener
 func (container *Container) RegisterWebsocketListeners() {
 	container.logger.Debug(fmt.Sprintf("registering listeners for %T", listeners.WebsocketListener{}))
@@ -1507,9 +1650,10 @@ func (container *Container) NotificationService() (service *services.PhoneNotifi
 	return services.NewNotificationService(
 		container.Logger(),
 		container.Tracer(),
-		container.FirebaseMessagingClient(),
+		container.FCMClient(),
 		container.PhoneRepository(),
 		container.PhoneNotificationRepository(),
+		container.MessageSendScheduleRepository(),
 		container.EventDispatcher(),
 	)
 }
@@ -1565,6 +1709,12 @@ func (container *Container) RegisterUserRoutes() {
 	container.UserHandler().RegisterRoutes(container.App(), container.AuthenticatedMiddleware())
 }
 
+// RegisterMessageSendScheduleRoutes registers routes for the /send-schedules prefix
+func (container *Container) RegisterMessageSendScheduleRoutes() {
+	container.logger.Debug(fmt.Sprintf("registering %T routes", &handlers.MessageSendScheduleHandler{}))
+	container.MessageSendScheduleHandler().RegisterRoutes(container.App(), container.AuthenticatedMiddleware())
+}
+
 // RegisterEventRoutes registers routes for the /events prefix
 func (container *Container) RegisterEventRoutes() {
 	container.logger.Debug(fmt.Sprintf("registering %T routes", &handlers.EventsHandler{}))
@@ -1589,12 +1739,22 @@ func (container *Container) RegisterSwaggerRoutes() {
 
 // HeartbeatRepository registers a new instance of repositories.HeartbeatRepository
 func (container *Container) HeartbeatRepository() repositories.HeartbeatRepository {
-	container.logger.Debug("creating GORM repositories.HeartbeatRepository")
-	return repositories.NewGormHeartbeatRepository(
-		container.Logger(),
-		container.Tracer(),
-		container.DedicatedDB(),
-	)
+	switch os.Getenv("HEARTBEAT_DB_BACKEND") {
+	case "mongodb":
+		container.logger.Debug("creating MongoDB repositories.HeartbeatRepository")
+		return repositories.NewMongoHeartbeatRepository(
+			container.Logger(),
+			container.Tracer(),
+			container.MongoDB(),
+		)
+	default:
+		container.logger.Debug("creating GORM repositories.HeartbeatRepository")
+		return repositories.NewGormHeartbeatRepository(
+			container.Logger(),
+			container.Tracer(),
+			container.DedicatedDB(),
+		)
+	}
 }
 
 // UserRepository registers a new instance of repositories.UserRepository
@@ -1609,22 +1769,29 @@ func (container *Container) UserRepository() repositories.UserRepository {
 }
 
 // PhoneRistrettoCache creates an in-memory *ristretto.Cache[string, *entities.Phone]
-func (container *Container) PhoneRistrettoCache() (cache *ristretto.Cache[string, *entities.Phone]) {
-	container.logger.Debug(fmt.Sprintf("creating %T", cache))
+func (container *Container) PhoneRistrettoCache() *ristretto.Cache[string, *entities.Phone] {
+	if container.phoneRistrettoCache != nil {
+		return container.phoneRistrettoCache
+	}
+	container.logger.Debug(fmt.Sprintf("creating %T", container.phoneRistrettoCache))
 	ristrettoCache, err := ristretto.NewCache[string, *entities.Phone](&ristretto.Config[string, *entities.Phone]{
 		MaxCost:     5000,
 		NumCounters: 5000 * 10,
 		BufferItems: 64,
 	})
 	if err != nil {
-		container.logger.Fatal(stacktrace.Propagate(err, "cannot create user ristretto cache"))
+		container.logger.Fatal(stacktrace.Propagate(err, "cannot create phone ristretto cache"))
 	}
-	return ristrettoCache
+	container.phoneRistrettoCache = ristrettoCache
+	return container.phoneRistrettoCache
 }
 
 // UserRistrettoCache creates an in-memory *ristretto.Cache[string, entities.AuthContext]
-func (container *Container) UserRistrettoCache() (cache *ristretto.Cache[string, entities.AuthContext]) {
-	container.logger.Debug(fmt.Sprintf("creating %T", cache))
+func (container *Container) UserRistrettoCache() *ristretto.Cache[string, entities.AuthContext] {
+	if container.userRistrettoCache != nil {
+		return container.userRistrettoCache
+	}
+	container.logger.Debug(fmt.Sprintf("creating %T", container.userRistrettoCache))
 	ristrettoCache, err := ristretto.NewCache[string, entities.AuthContext](&ristretto.Config[string, entities.AuthContext]{
 		MaxCost:     5000,
 		NumCounters: 5000 * 10,
@@ -1633,12 +1800,13 @@ func (container *Container) UserRistrettoCache() (cache *ristretto.Cache[string,
 	if err != nil {
 		container.logger.Fatal(stacktrace.Propagate(err, "cannot create user ristretto cache"))
 	}
+	container.userRistrettoCache = ristrettoCache
 	return ristrettoCache
 }
 
 // InitializeTraceProvider initializes the open telemetry trace provider
 func (container *Container) InitializeTraceProvider() func() {
-	return container.initializeUptraceProvider(container.version, container.projectID)
+	return container.initializeAxiomTraceProvider(container.version, container.projectID)
 }
 
 func (container *Container) initializeGoogleTraceProvider(version string, namespace string) func() {
@@ -1677,6 +1845,63 @@ func (container *Container) initializeGoogleTraceProvider(version string, namesp
 	}
 }
 
+func (container *Container) initializeAxiomTraceProvider(version string, namespace string) func() {
+	container.logger.Debug("initializing axiom trace provider")
+
+	traceHeaders := map[string]string{
+		"Authorization":   "Bearer " + os.Getenv("AXIOM_TOKEN"),
+		"X-Axiom-Dataset": os.Getenv("AXIOM_DATASET_EVENTS"),
+	}
+
+	traceExporter, err := otlptracehttp.New(context.Background(),
+		otlptracehttp.WithEndpoint("us-east-1.aws.edge.axiom.co"),
+		otlptracehttp.WithHeaders(traceHeaders),
+	)
+	if err != nil {
+		container.logger.Fatal(stacktrace.Propagate(err, "cannot create axiom OTLP trace exporter"))
+	}
+
+	tp := trace.NewTracerProvider(
+		trace.WithBatcher(traceExporter),
+		trace.WithSampler(trace.AlwaysSample()),
+		trace.WithResource(container.OtelResources(version, namespace)),
+	)
+	otel.SetTracerProvider(tp)
+
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+
+	metricHeaders := map[string]string{
+		"Authorization":   "Bearer " + os.Getenv("AXIOM_TOKEN"),
+		"X-Axiom-Dataset": os.Getenv("AXIOM_DATASET_METRICS"),
+	}
+
+	metricExporter, err := otlpmetrichttp.New(context.Background(),
+		otlpmetrichttp.WithEndpoint("us-east-1.aws.edge.axiom.co"),
+		otlpmetrichttp.WithHeaders(metricHeaders),
+	)
+	if err != nil {
+		container.logger.Fatal(stacktrace.Propagate(err, "cannot create axiom OTLP metric exporter"))
+	}
+
+	meterProvider := metric.NewMeterProvider(
+		metric.WithReader(metric.NewPeriodicReader(metricExporter)),
+		metric.WithResource(container.OtelResources(version, namespace)),
+	)
+	otel.SetMeterProvider(meterProvider)
+
+	return func() {
+		if err := tp.Shutdown(context.Background()); err != nil {
+			container.logger.Error(stacktrace.Propagate(err, "cannot shutdown axiom trace provider"))
+		}
+		if err := meterProvider.Shutdown(context.Background()); err != nil {
+			container.logger.Error(stacktrace.Propagate(err, "cannot shutdown axiom meter provider"))
+		}
+	}
+}
+
 func (container *Container) initializeUptraceProvider(version string, namespace string) (flush func()) {
 	container.logger.Debug("initializing uptrace provider")
 	// Configure OpenTelemetry with sensible defaults.
@@ -1698,8 +1923,8 @@ func (container *Container) initializeUptraceProvider(version string, namespace 
 
 func logger(skipFrameCount int) telemetry.Logger {
 	fields := map[string]string{
-		"pid":      strconv.Itoa(os.Getpid()),
-		"hostname": hostName(),
+		"hostname":                               hostName(),
+		string(semconv.DeploymentEnvironmentKey): os.Getenv("ENV"),
 	}
 
 	return telemetry.NewZerologLogger(
@@ -1714,7 +1939,7 @@ func logDriver(skipFrameCount int) *zerodriver.Logger {
 	if isLocal() {
 		return consoleLogger(skipFrameCount)
 	}
-	return jsonLogger(skipFrameCount)
+	return axiomLogger(skipFrameCount)
 }
 
 func jsonLogger(skipFrameCount int) *zerodriver.Logger {
@@ -1740,6 +1965,19 @@ func jsonLogger(skipFrameCount int) *zerodriver.Logger {
 	zerolog.TimeFieldFormat = time.RFC3339Nano
 
 	zl := zerolog.New(os.Stderr).With().Timestamp().CallerWithSkipFrameCount(skipFrameCount).Logger()
+	return &zerodriver.Logger{Logger: &zl}
+}
+
+func axiomLogger(skipFrameCount int) *zerodriver.Logger {
+	axiomWriter, err := axiomzerolog.New(
+		axiomzerolog.SetLevels([]zerolog.Level{zerolog.TraceLevel, zerolog.DebugLevel, zerolog.InfoLevel, zerolog.WarnLevel, zerolog.ErrorLevel, zerolog.PanicLevel, zerolog.FatalLevel, zerolog.NoLevel}),
+		axiomzerolog.SetDataset(os.Getenv("AXIOM_DATASET_EVENTS")),
+	)
+	if err != nil {
+		log.Fatal(stacktrace.Propagate(err, "cannot create axiom zerolog writer"))
+	}
+
+	zl := zerolog.New(axiomWriter).With().Timestamp().CallerWithSkipFrameCount(skipFrameCount).Logger()
 	return &zerodriver.Logger{Logger: &zl}
 }
 

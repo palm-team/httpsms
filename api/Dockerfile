@@ -21,17 +21,13 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-X main.Version=$GI
 
 FROM alpine:latest
 
-RUN addgroup -S http-sms && adduser -S http-sms -G http-sms
+RUN apk add --no-cache curl && addgroup -S http-sms && adduser -S http-sms -G http-sms
 
 USER http-sms
 WORKDIR /home/http-sms
 
 COPY --from=builder /usr/local/go/lib/time/zoneinfo.zip /zoneinfo.zip
 COPY --from=builder /bin/http-sms ./
-COPY --from=builder /http-sms/root.crt ./
-
 ENV ZONEINFO=/zoneinfo.zip
-
-EXPOSE 8000
 
 ENTRYPOINT ["./http-sms", "--dotenv=false"]
