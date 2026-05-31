@@ -6,7 +6,7 @@ WORKDIR /app
 COPY package.json pnpm-lock.yaml ./
 
 # Install pnpm
-RUN npm install -g pnpm
+RUN npm install -g pnpm && pnpm config set ignore-build-scripts false
 
 # install python
 RUN apk add --no-cache python3
