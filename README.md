@@ -277,6 +277,34 @@ docker compose down -v
 
 Integration tests also run automatically in CI on every push/PR to `main`.
 
+## Deploy to Railway
+
+[Railway](https://railway.app) is supported as an alternative deployment target to Google Cloud Run and Firebase hosting. The project includes Railway-specific configuration files and environment variable references in the `api/` and `web/` directories.
+
+### Prerequisites
+
+- A Railway account
+- A Firebase project with web SDK and service account credentials
+- SMTP credentials for email delivery
+
+### Quick Start
+
+See the detailed deployment guide at [`specs/001-railway-deployment/quickstart.md`](specs/001-railway-deployment/quickstart.md) for step-by-step instructions on:
+
+1. Creating a Railway project and adding PostgreSQL + Redis plugins
+2. Deploying the API service with `api/railway.toml`
+3. Deploying the Web UI service with `web/railway.toml`
+4. Configuring all required environment variables (see `api/.env.railway` and `web/.env.railway`)
+5. Creating the system user for async event processing
+6. Verifying the deployment
+
+### Key Changes for Railway
+
+- `api/Dockerfile`: `EXPOSE 8000` and CockroachDB `root.crt` copy removed — the API reads `APP_PORT` from environment variables
+- `web/nginx.conf`: Uses `${PORT}` placeholder for Railway's dynamic port assignment
+- `web/Dockerfile`: Uses `envsubst` to render the nginx config at container startup
+- `docker-compose.yml`: Includes `PORT=3000` for the web service to preserve local Docker Compose compatibility
+
 ## License
 
 This project is licensed under the GNU AFFERO GENERAL PUBLIC LICENSE Version 3 - see the [LICENSE](LICENSE) file for details
