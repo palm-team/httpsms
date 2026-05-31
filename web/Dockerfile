@@ -27,4 +27,4 @@ RUN apk add --no-cache gettext
 
 EXPOSE 3000
 
-CMD ["/bin/sh", "-c", "export PORT=${PORT:-3000} && envsubst '${PORT}' < /etc/nginx/conf.d/default.conf > /tmp/default.conf && mv /tmp/default.conf /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'"
+CMD export PORT=${PORT:-3000} && envsubst '${PORT}' < /etc/nginx/conf.d/default.conf > /tmp/default.conf && mv /tmp/default.conf /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'
